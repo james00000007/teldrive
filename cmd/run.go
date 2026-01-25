@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"reflect"
 	"regexp"
 	"time"
 
@@ -46,13 +47,13 @@ func NewRun() *cobra.Command {
 			if err := loader.Load(cmd, &cfg); err != nil {
 				return err
 			}
-			if err := loader.Validate(); err != nil {
+			if err := loader.Validate(&cfg); err != nil {
 				return err
 			}
 			return nil
 		},
 	}
-	loader.RegisterFlags(cmd.Flags(), "", cfg, false)
+	loader.RegisterFlags(cmd.Flags(), reflect.TypeFor[config.ServerCmdConfig]())
 	return cmd
 }
 
@@ -79,58 +80,71 @@ func runApplication(ctx context.Context, conf *config.ServerCmdConfig) {
 		FilePath: conf.Log.File,
 	})
 
-	lg := logging.DefaultLogger().Sugar()
+	lg := logging.DefaultLogger()
 
 	defer lg.Sync()
 
 	port, err := findAvailablePort(conf.Server.Port)
 	if err != nil {
-		lg.Fatalw("failed to find available port", "err", err)
+		lg.Fatal("failed to find available port", zap.Error(err))
 	}
 	if port != conf.Server.Port {
-		lg.Infof("Port %d is occupied, using port %d instead", conf.Server.Port, port)
+		lg.Info("port occupied", zap.Int("occupied_port", conf.Server.Port), zap.Int("new_port", port))
 		conf.Server.Port = port
 	}
 
-	cacher := cache.NewCache(ctx, &conf.Cache)
+	// Create Redis client globally (nil if not configured)
+	redisClient, err := cache.NewRedisClient(ctx, &conf.Redis)
+	if err != nil {
+		lg.Fatal("failed to connect to redis", zap.Error(err))
+	}
+
+	// Create cache with shared Redis client
+	cacher := cache.NewCache(ctx, conf.Cache.MaxSize, redisClient)
+
+	// Create bot selector with shared Redis client
+	botSelector := tgc.NewBotSelector(redisClient)
 
 	db, err := database.NewDatabase(ctx, &conf.DB, lg)
 
 	if err != nil {
-		lg.Fatalw("failed to create database", "err", err)
+		lg.Fatal("failed to create database", zap.Error(err))
 	}
 
 	err = database.MigrateDB(db)
 
 	if err != nil {
-		lg.Fatalw("failed to migrate database", "err", err)
+		lg.Fatal("failed to migrate database", zap.Error(err))
 	}
-
-	worker := tgc.NewBotWorker()
 
 	logger := logging.DefaultLogger()
 
 	eventRecorder := events.NewRecorder(ctx, db, logger)
 
-	srv := setupServer(conf, db, cacher, logger, worker, eventRecorder)
+	srv := setupServer(conf, db, cacher, logger, botSelector, eventRecorder)
 
 	if conf.CronJobs.Enable {
 		err = cron.StartCronJobs(ctx, db, conf)
 		if err != nil {
-			lg.Fatalw("failed to start cron scheduler", "err", err)
+			lg.Fatal("failed to start cron scheduler", zap.Error(err))
 		}
 	}
 
 	go func() {
-		lg.Infof("Server started at http://localhost:%d", conf.Server.Port)
+		lg.Info("server started", zap.String("address", fmt.Sprintf("http://localhost:%d", conf.Server.Port)))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			lg.Errorw("failed to start server", "err", err)
+			lg.Error("failed to start server", zap.Error(err))
 		}
 	}()
 
 	<-ctx.Done()
 
-	lg.Info("Shutting down server...")
+	lg.Info("shutting down server")
+
+	// Close Redis client if it was created
+	if redisClient != nil {
+		redisClient.Close()
+	}
 
 	eventRecorder.Shutdown()
 
@@ -139,15 +153,15 @@ func runApplication(ctx context.Context, conf *config.ServerCmdConfig) {
 	defer shutdownCancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		lg.Errorw("server shutdown failed", "err", err)
+		lg.Error("server shutdown failed", zap.Error(err))
 	}
 
-	lg.Info("Server stopped")
+	lg.Info("server stopped")
 }
 
-func setupServer(cfg *config.ServerCmdConfig, db *gorm.DB, cache cache.Cacher, lg *zap.Logger, worker *tgc.BotWorker, eventRecorder *events.Recorder) *http.Server {
+func setupServer(cfg *config.ServerCmdConfig, db *gorm.DB, cache cache.Cacher, lg *zap.Logger, botSelector tgc.BotSelector, eventRecorder *events.Recorder) *http.Server {
 
-	apiSrv := services.NewApiService(db, cfg, cache, worker, eventRecorder)
+	apiSrv := services.NewApiService(db, cfg, cache, botSelector, eventRecorder)
 
 	srv, err := api.NewServer(apiSrv, auth.NewSecurityHandler(db, cache, &cfg.JWT))
 

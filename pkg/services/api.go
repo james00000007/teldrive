@@ -28,10 +28,18 @@ type apiService struct {
 	db             *gorm.DB
 	cnf            *config.ServerCmdConfig
 	cache          cache.Cacher
-	worker         *tgc.BotWorker
-	middlewares    []telegram.Middleware
+	botSelector    tgc.BotSelector
 	events         *events.Recorder
 	channelManager *tgc.ChannelManager
+}
+
+func (a *apiService) newMiddlewares(ctx context.Context, retries int) []telegram.Middleware {
+	return tgc.NewMiddleware(&a.cnf.TG,
+		tgc.WithFloodWait(),
+		tgc.WithRecovery(ctx),
+		tgc.WithRetry(retries),
+		tgc.WithRateLimit(),
+	)
 }
 
 func (a *apiService) VersionVersion(ctx context.Context) (*api.ApiVersion, error) {
@@ -82,7 +90,7 @@ func (a *apiService) NewError(ctx context.Context, err error) *api.ErrorStatusCo
 			code = apiError.code
 			message = apiError.Error()
 		}
-		logging.FromContext(ctx).Error("api error", zap.Error(apiError))
+		logging.FromContext(ctx).Error("api error", zap.Error(apiError.err))
 	}
 	return &api.ErrorStatusCode{StatusCode: code, Response: api.Error{Code: code, Message: message}}
 }
@@ -90,19 +98,16 @@ func (a *apiService) NewError(ctx context.Context, err error) *api.ErrorStatusCo
 func NewApiService(db *gorm.DB,
 	cnf *config.ServerCmdConfig,
 	cache cache.Cacher,
-	worker *tgc.BotWorker,
+	botSelector tgc.BotSelector,
 	events *events.Recorder) *apiService {
-
-	middlewares := tgc.NewMiddleware(&cnf.TG, tgc.WithFloodWait(), tgc.WithRateLimit())
 
 	return &apiService{
 		db:             db,
 		cnf:            cnf,
 		cache:          cache,
-		worker:         worker,
-		middlewares:    middlewares,
+		botSelector:    botSelector,
 		events:         events,
-		channelManager: tgc.NewChannelManager(db, cache, &cnf.TG, middlewares),
+		channelManager: tgc.NewChannelManager(db, cache, &cnf.TG),
 	}
 }
 

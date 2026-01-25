@@ -15,6 +15,7 @@ import (
 const (
 	installer = "https://instl.vercel.app"
 	repo      = "tgdrive/teldrive"
+	windowsOS = "windows"
 )
 
 type scriptExecutor struct {
@@ -37,7 +38,7 @@ func executeScript(e scriptExecutor) error {
 
 	if e.platformType == "windows" {
 		oldPath := filepath.Join(executableDir, executableName+".old")
-		_ = os.Remove(oldPath)
+		os.Remove(oldPath)
 		if err := os.Rename(executable, oldPath); err != nil {
 			return fmt.Errorf("failed to rename executable: %v", err)
 		}
@@ -81,7 +82,7 @@ func executeScript(e scriptExecutor) error {
 	if err := cmd.Wait(); err != nil {
 		if e.platformType == "windows" {
 			oldPath := filepath.Join(executableDir, executableName+".old")
-			_ = os.Rename(oldPath, executable)
+			os.Rename(oldPath, executable)
 		}
 		return fmt.Errorf("script execution failed: %v", err)
 	}
@@ -89,7 +90,7 @@ func executeScript(e scriptExecutor) error {
 	if e.platformType == "windows" {
 		go func() {
 			oldPath := filepath.Join(executableDir, executableName+".old")
-			_ = os.Remove(oldPath)
+			os.Remove(oldPath)
 		}()
 	}
 

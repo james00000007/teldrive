@@ -3,10 +3,11 @@ package events
 import (
 	"context"
 
-	"github.com/tgdrive/teldrive/pkg/models"
 	"go.uber.org/zap"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+
+	"github.com/tgdrive/teldrive/pkg/models"
 )
 
 type EventType string
@@ -24,6 +25,7 @@ type Recorder struct {
 	events chan models.Event
 	logger *zap.Logger
 	ctx    context.Context
+	done   chan struct{}
 }
 
 func NewRecorder(ctx context.Context, db *gorm.DB, logger *zap.Logger) *Recorder {
@@ -32,6 +34,7 @@ func NewRecorder(ctx context.Context, db *gorm.DB, logger *zap.Logger) *Recorder
 		events: make(chan models.Event, 1000),
 		logger: logger,
 		ctx:    ctx,
+		done:   make(chan struct{}),
 	}
 
 	go r.processEvents()
@@ -56,21 +59,46 @@ func (r *Recorder) Record(eventType EventType, userID int64, source *models.Sour
 }
 
 func (r *Recorder) processEvents() {
+	defer close(r.done)
 	for {
 		select {
 		case <-r.ctx.Done():
+			r.drainEvents()
 			return
-		case evt := <-r.events:
+		case evt, ok := <-r.events:
+			if !ok {
+				return
+			}
 			if err := r.db.Create(&evt).Error; err != nil {
 				r.logger.Error("failed to save event",
 					zap.Error(err),
-					zap.String("type", string(evt.Type)),
+					zap.String("type", string(evt.Type)), //nolint:unconvert
 					zap.Int64("user_id", evt.UserID))
 			}
 		}
 	}
 }
 
+func (r *Recorder) drainEvents() {
+	for {
+		select {
+		case evt, ok := <-r.events:
+			if !ok {
+				return
+			}
+			if err := r.db.Create(&evt).Error; err != nil {
+				r.logger.Error("failed to save event during shutdown",
+					zap.Error(err),
+					zap.String("type", string(evt.Type)), //nolint:unconvert
+					zap.Int64("user_id", evt.UserID))
+			}
+		default:
+			return
+		}
+	}
+}
+
 func (r *Recorder) Shutdown() {
 	close(r.events)
+	<-r.done
 }
