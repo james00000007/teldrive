@@ -6,29 +6,33 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/tgdrive/teldrive/internal/config"
+	"github.com/tgdrive/teldrive/internal/logging"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"gorm.io/gorm"
 	glogger "gorm.io/gorm/logger"
-	"gorm.io/gorm/utils"
 )
 
-const msgPrefix = "[DB] "
-
 type Logger struct {
-	cfg glogger.Config
-	lg  *zap.Logger
+	cfg    glogger.Config
+	lg     *zap.Logger
+	logCfg *config.DBLoggingConfig
 }
 
-func NewLogger(lg *zap.Logger, slowThreshold time.Duration, ignoreRecordNotFoundError bool, level zapcore.Level) *Logger {
+func NewLogger(lg *zap.Logger, slowThreshold time.Duration, ignoreRecordNotFoundError bool, level zapcore.Level, logCfg *config.DBLoggingConfig) *Logger {
 	cfg := glogger.Config{
 		SlowThreshold:             slowThreshold,
 		Colorful:                  false,
 		IgnoreRecordNotFoundError: ignoreRecordNotFoundError,
 	}
+
+	// Map zap level to gorm level - be conservative in production
 	switch level {
-	case zapcore.DebugLevel, zapcore.InfoLevel:
+	case zapcore.DebugLevel:
 		cfg.LogLevel = glogger.Info
+	case zapcore.InfoLevel:
+		cfg.LogLevel = glogger.Warn // Production: only warnings and errors
 	case zapcore.WarnLevel:
 		cfg.LogLevel = glogger.Warn
 	case zapcore.ErrorLevel:
@@ -36,7 +40,13 @@ func NewLogger(lg *zap.Logger, slowThreshold time.Duration, ignoreRecordNotFound
 	default:
 		cfg.LogLevel = glogger.Silent
 	}
-	return &Logger{cfg: cfg, lg: lg.WithOptions(zap.AddCallerSkip(3))}
+
+	// Use component logger instead of raw logger with prefix
+	return &Logger{
+		cfg:    cfg,
+		lg:     logging.Component("DB").WithOptions(zap.AddCallerSkip(3)),
+		logCfg: logCfg,
+	}
 }
 
 func (l *Logger) LogMode(level glogger.LogLevel) glogger.Interface {
@@ -45,21 +55,21 @@ func (l *Logger) LogMode(level glogger.LogLevel) glogger.Interface {
 	return &newlogger
 }
 
-func (l *Logger) Info(ctx context.Context, s string, i ...any) {
+func (l *Logger) Info(ctx context.Context, msg string, args ...any) {
 	if l.cfg.LogLevel >= glogger.Info {
-		l.lg.Info(fmt.Sprintf(msgPrefix+s, i...))
+		l.lg.Info("db.info", zap.String("message", fmt.Sprintf(msg, args...)))
 	}
 }
 
-func (l *Logger) Warn(ctx context.Context, s string, i ...any) {
+func (l *Logger) Warn(ctx context.Context, msg string, args ...any) {
 	if l.cfg.LogLevel >= glogger.Warn {
-		l.lg.Warn(fmt.Sprintf(msgPrefix+s, i...))
+		l.lg.Warn("db.warning", zap.String("message", fmt.Sprintf(msg, args...)))
 	}
 }
 
-func (l *Logger) Error(ctx context.Context, s string, i ...any) {
+func (l *Logger) Error(ctx context.Context, msg string, args ...any) {
 	if l.cfg.LogLevel >= glogger.Error {
-		l.lg.Error(fmt.Sprintf(msgPrefix+s, i...))
+		l.lg.Error("db.error", zap.String("message", fmt.Sprintf(msg, args...)))
 	}
 }
 
@@ -68,26 +78,41 @@ func (l *Logger) Trace(ctx context.Context, begin time.Time, fc func() (string, 
 		return
 	}
 
-	elapsed := time.Since(begin)
-	duration := float64(elapsed.Nanoseconds()) / 1e6
-
+	elapsed := min(max(time.Since(begin), 0), time.Hour)
 	sql, rows := fc()
 
+	// Calculate duration in milliseconds with overflow protection
+	durationMs := max(elapsed.Milliseconds(), 0)
+
+	// Calculate threshold and excess in milliseconds
+	thresholdMs := max(l.cfg.SlowThreshold.Milliseconds(), 0)
+	excessMs := max(durationMs-thresholdMs, 0)
+
 	fields := []zap.Field{
-		zap.String("source", utils.FileWithLineNum()),
-		zap.Float64("duration_ms", duration),
-		zap.String("sql", sql),
+		zap.Int64("duration_ms", durationMs),
 	}
+
 	if rows != -1 {
-		fields = append(fields, zap.Int64("rows", rows))
+		fields = append(fields, zap.Int64("rows_affected", rows))
+	}
+
+	if l.logCfg != nil && l.logCfg.LogSQL {
+		fields = append(fields, zap.String("sql", sql))
 	}
 
 	switch {
 	case err != nil && l.cfg.LogLevel >= glogger.Error && (!errors.Is(err, gorm.ErrRecordNotFound) || !l.cfg.IgnoreRecordNotFoundError):
-		l.lg.Error("trace error", append(fields, zap.Error(err))...)
+		l.lg.Error("db.query_failed", append(fields, zap.Error(err))...)
+
 	case elapsed > l.cfg.SlowThreshold && l.cfg.SlowThreshold != 0 && l.cfg.LogLevel >= glogger.Warn:
-		l.lg.Warn("slow sql", append(fields, zap.Duration("threshold", l.cfg.SlowThreshold))...)
+		fields = append(fields,
+			zap.Int64("threshold_ms", thresholdMs),
+			zap.Int64("excess_ms", excessMs),
+		)
+		l.lg.Warn("db.slow_query", fields...)
+
 	case l.cfg.LogLevel == glogger.Info:
-		l.lg.Info("trace", fields...)
+		// Only log successful queries in debug mode
+		l.lg.Debug("db.query", fields...)
 	}
 }

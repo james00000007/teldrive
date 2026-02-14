@@ -5,17 +5,21 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"reflect"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
+	"github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
 	"github.com/tgdrive/teldrive/internal/api"
 	"github.com/tgdrive/teldrive/internal/appcontext"
 	"github.com/tgdrive/teldrive/internal/auth"
+	"github.com/tgdrive/teldrive/internal/banner"
 	"github.com/tgdrive/teldrive/internal/cache"
 	"github.com/tgdrive/teldrive/internal/chizap"
 	"github.com/tgdrive/teldrive/internal/config"
@@ -24,6 +28,7 @@ import (
 	"github.com/tgdrive/teldrive/internal/logging"
 	"github.com/tgdrive/teldrive/internal/middleware"
 	"github.com/tgdrive/teldrive/internal/tgc"
+	"github.com/tgdrive/teldrive/internal/version"
 	"github.com/tgdrive/teldrive/ui"
 
 	"github.com/tgdrive/teldrive/pkg/cron"
@@ -80,93 +85,171 @@ func runApplication(ctx context.Context, conf *config.ServerCmdConfig) {
 		FilePath: conf.Log.File,
 	})
 
-	lg := logging.DefaultLogger()
-
+	lg := logging.Component("APP")
 	defer lg.Sync()
+
+	banner.PrintBanner(banner.StartupInfo{
+		Version:  version.Version,
+		Addr:     fmt.Sprintf(":%d", conf.Server.Port),
+		LogLevel: conf.Log.Level,
+	})
 
 	port, err := findAvailablePort(conf.Server.Port)
 	if err != nil {
-		lg.Fatal("failed to find available port", zap.Error(err))
+		lg.Error("failed to find available port", zap.Error(err))
+		os.Exit(1)
 	}
 	if port != conf.Server.Port {
-		lg.Info("port occupied", zap.Int("occupied_port", conf.Server.Port), zap.Int("new_port", port))
+		lg.Info("server.port_occupied", zap.Int("occupied_port", conf.Server.Port), zap.Int("new_port", port))
 		conf.Server.Port = port
 	}
 
-	// Create Redis client globally (nil if not configured)
-	redisClient, err := cache.NewRedisClient(ctx, &conf.Redis)
-	if err != nil {
-		lg.Fatal("failed to connect to redis", zap.Error(err))
-	}
+	// Channel for background service initialization errors
+	initErrCh := make(chan error, 3)
 
-	// Create cache with shared Redis client
-	cacher := cache.NewCache(ctx, conf.Cache.MaxSize, redisClient)
+	// Create cancellable context for background services
+	bgCtx, bgCancel := context.WithCancel(ctx)
+	defer bgCancel()
 
-	// Create bot selector with shared Redis client
-	botSelector := tgc.NewBotSelector(redisClient)
-
-	db, err := database.NewDatabase(ctx, &conf.DB, lg)
-
-	if err != nil {
-		lg.Fatal("failed to create database", zap.Error(err))
-	}
-
-	err = database.MigrateDB(db)
-
-	if err != nil {
-		lg.Fatal("failed to migrate database", zap.Error(err))
-	}
-
-	logger := logging.DefaultLogger()
-
-	eventRecorder := events.NewRecorder(ctx, db, logger)
-
-	srv := setupServer(conf, db, cacher, logger, botSelector, eventRecorder)
-
-	if conf.CronJobs.Enable {
-		err = cron.StartCronJobs(ctx, db, conf)
-		if err != nil {
-			lg.Fatal("failed to start cron scheduler", zap.Error(err))
-		}
-	}
+	// Start Redis and cache initialization in background
+	var redisClient *redis.Client
+	var cacher cache.Cacher
+	var botSelector tgc.BotSelector
+	var redisOnce sync.Once
+	var redisReady = make(chan struct{})
 
 	go func() {
-		lg.Info("server started", zap.String("address", fmt.Sprintf("http://localhost:%d", conf.Server.Port)))
+		client, err := cache.NewRedisClient(bgCtx, &conf.Redis)
+		if err != nil {
+			lg.Error("redis.client_failed", zap.Error(err))
+			initErrCh <- fmt.Errorf("redis connection failed: %w", err)
+			return
+		}
+		redisClient = client
+		cacher = cache.NewCache(bgCtx, conf.Cache.MaxSize, redisClient, lg)
+		botSelector = tgc.NewBotSelector(redisClient)
+		redisOnce.Do(func() { close(redisReady) })
+	}()
+
+	// Initialize database (blocking - server needs this)
+	db, err := database.NewDatabase(ctx, &conf.DB, &conf.Log.DB, lg)
+	if err != nil {
+		lg.Error("failed to create database", zap.Error(err))
+		os.Exit(1)
+	}
+
+	if err := database.MigrateDB(db); err != nil {
+		lg.Error("failed to migrate database", zap.Error(err))
+		os.Exit(1)
+	}
+
+	// Wait for cache to be ready before setting up server
+	select {
+	case <-redisReady:
+		// Cache ready, continue
+	case <-ctx.Done():
+		lg.Error("server.startup_cancelled")
+		os.Exit(1)
+	}
+
+	// Create broadcaster config from settings
+	broadcasterConfig := events.BroadcasterConfig{
+		DBWorkers:        conf.Events.DBWorkers,
+		DBBufferSize:     conf.Events.DBBufferSize,
+		DeduplicationTTL: conf.Events.DeduplicationTTL,
+	}
+
+	// Start event broadcaster in background
+	var eventBroadcaster events.EventBroadcaster
+	var eventsOnce sync.Once
+	var eventsReady = make(chan struct{})
+
+	go func() {
+		eventBroadcaster = events.NewBroadcaster(bgCtx, db, redisClient, conf.Events.PollInterval, broadcasterConfig, logging.Component("EVENT"))
+		eventsOnce.Do(func() { close(eventsReady) })
+	}()
+
+	// Wait for events to be ready
+	select {
+	case <-eventsReady:
+		// Events ready, continue
+	case <-ctx.Done():
+		lg.Error("server.startup_cancelled")
+		os.Exit(1)
+	}
+
+	// Setup and start HTTP server immediately
+	srv := setupServer(conf, db, cacher, lg, botSelector, eventBroadcaster)
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		lg.Info("server.started", zap.String("address", fmt.Sprintf("http://localhost:%d", conf.Server.Port)))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			lg.Error("failed to start server", zap.Error(err))
+			serverErrCh <- err
 		}
 	}()
 
-	<-ctx.Done()
+	// Start cron jobs in background if enabled
+	if conf.CronJobs.Enable {
+		go func() {
+			if err := cron.StartCronJobs(bgCtx, db, conf); err != nil {
+				lg.Error("cron.init.failed", zap.Error(err))
+				initErrCh <- fmt.Errorf("cron scheduler failed: %w", err)
+				return
+			}
+			lg.Debug("cron.init.completed")
+		}()
+	}
 
-	lg.Info("shutting down server")
+	// Main thread: wait for shutdown signal or fatal error
+	select {
+	case <-ctx.Done():
+		lg.Info("server.shutdown_signal_received")
+	case err := <-initErrCh:
+		lg.Error("background_service.failed", zap.Error(err))
+		os.Exit(1)
+	case err := <-serverErrCh:
+		lg.Error("server.crashed", zap.Error(err))
+		os.Exit(1)
+	}
+
+	// Graceful shutdown sequence
+	lg.Info("server.shutdown.starting")
+
+	// Cancel background context to stop all background services
+	bgCancel()
+
+	// Shutdown event broadcaster
+	if eventBroadcaster != nil {
+		eventBroadcaster.Shutdown()
+	}
+
+	// Shutdown HTTP server with timeout
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), conf.Server.GracefulShutdown)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		lg.Error("server.shutdown.failed", zap.Error(err))
+	}
 
 	// Close Redis client if it was created
 	if redisClient != nil {
 		redisClient.Close()
 	}
 
-	eventRecorder.Shutdown()
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), conf.Server.GracefulShutdown)
-
-	defer shutdownCancel()
-
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		lg.Error("server shutdown failed", zap.Error(err))
-	}
-
-	lg.Info("server stopped")
+	lg.Info("server.stopped")
 }
 
-func setupServer(cfg *config.ServerCmdConfig, db *gorm.DB, cache cache.Cacher, lg *zap.Logger, botSelector tgc.BotSelector, eventRecorder *events.Recorder) *http.Server {
+func setupServer(cfg *config.ServerCmdConfig, db *gorm.DB, cache cache.Cacher, lg *zap.Logger, botSelector tgc.BotSelector, eventBroadcaster events.EventBroadcaster) *http.Server {
 
-	apiSrv := services.NewApiService(db, cfg, cache, botSelector, eventRecorder)
+	apiSrv := services.NewApiService(db, cfg, cache, botSelector, eventBroadcaster)
 
 	srv, err := api.NewServer(apiSrv, auth.NewSecurityHandler(db, cache, &cfg.JWT))
 
 	if err != nil {
-		lg.Fatal("failed to create server", zap.Error(err))
+		lg.Error("failed to create server", zap.Error(err))
+		os.Exit(1)
+		return nil // unreachable but required for compilation
 	}
 
 	extendedSrv := services.NewExtendedMiddleware(srv, services.NewExtendedService(apiSrv))
@@ -182,12 +265,11 @@ func setupServer(cfg *config.ServerCmdConfig, db *gorm.DB, cache cache.Cacher, l
 	}))
 	mux.Use(chimiddleware.RealIP)
 	mux.Use(middleware.InjectLogger(lg))
-	mux.Use(chizap.ChizapWithConfig(lg, &chizap.Config{
-		TimeFormat: time.RFC3339,
-		UTC:        true,
+	mux.Use(chizap.ChizapWithConfig(logging.Component("HTTP"), &chizap.Config{
 		SkipPathRegexps: []*regexp.Regexp{
 			regexp.MustCompile(`^/(assets|images|docs)/.*`),
 		},
+		HTTPConfig: &cfg.Log.HTTP,
 	}))
 	mux.Use(appcontext.Middleware)
 	mux.Mount("/api/", http.StripPrefix("/api", extendedSrv))

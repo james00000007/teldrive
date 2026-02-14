@@ -16,6 +16,7 @@ import (
 	"github.com/tgdrive/teldrive/internal/api"
 	"github.com/tgdrive/teldrive/internal/auth"
 	"github.com/tgdrive/teldrive/internal/crypt"
+	"github.com/tgdrive/teldrive/internal/hash"
 	"github.com/tgdrive/teldrive/internal/logging"
 	"github.com/tgdrive/teldrive/internal/pool"
 	"github.com/tgdrive/teldrive/internal/tgc"
@@ -87,7 +88,6 @@ func (a *apiService) prepareEncryption(params *api.UploadsUploadParams, fileStre
 	if !params.Encrypted.Value {
 		return fileStream, fileSize, "", nil
 	}
-	logger.Debug("upload: preparing encryption", zap.String("partName", params.PartName))
 	salt, err := generateRandomSalt()
 	if err != nil {
 		return nil, 0, "", err
@@ -135,8 +135,6 @@ func (a *apiService) uploadToTelegram(ctx context.Context, client *tg.Client, ch
 		return nil, err
 	}
 
-	logger.Debug("upload: starting telegram upload", zap.String("partName", params.PartName), zap.Int64("size", fileSize))
-
 	u := uploader.NewUploader(client).WithThreads(a.cnf.TG.Uploads.Threads).WithPartSize(512 * 1024)
 	upload, err := u.Upload(ctx, uploader.NewUpload(params.PartName, fileStream, fileSize))
 	if err != nil {
@@ -152,14 +150,16 @@ func (a *apiService) uploadToTelegram(ctx context.Context, client *tg.Client, ch
 		return nil, err
 	}
 
-	logger.Debug("upload: telegram upload complete", zap.String("partName", params.PartName))
-
 	updates := res.(*tg.Updates)
 	var message *tg.Message
 	for _, update := range updates.Updates {
 		if channelMsg, ok := update.(*tg.UpdateNewChannelMessage); ok {
-			message = channelMsg.Message.(*tg.Message)
-			break
+			if msg, ok := channelMsg.Message.AsNotEmpty(); ok {
+				if m, ok := msg.(*tg.Message); ok {
+					message = m
+					break
+				}
+			}
 		}
 	}
 
@@ -175,15 +175,32 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 	}
 
 	userId := auth.GetUser(ctx)
-	logger := logging.FromContext(ctx)
+	// Create upload component logger with common fields
+	logger := logging.Component("UPLOAD").With(
+		zap.String("file_name", params.FileName),
+		zap.String("part_name", params.PartName),
+		zap.Int("part_no", params.PartNo),
+		zap.Int64("size", params.ContentLength),
+	)
 
 	channelId := params.ChannelId.Value
 	if channelId == 0 {
 		var err error
 		channelId, err = a.channelManager.CurrentChannel(ctx, userId)
-		if err != nil {
+		if err != nil && err != tgc.ErrNoDefaultChannel {
 			return nil, &apiError{err: err}
 		}
+		if err == tgc.ErrNoDefaultChannel || (a.cnf.TG.AutoChannelCreate && a.channelManager.ChannelLimitReached(channelId)) {
+			logger.Info("channel.limit.reached", zap.Int64("channel_id", channelId), zap.Int64("limit", a.cnf.TG.ChannelLimit))
+			newChannelId, err := a.channelManager.CreateNewChannel(ctx, "", userId, true)
+			if err != nil {
+				logger.Error("channel.create.failed", zap.Error(err))
+				return nil, &apiError{err: err}
+			}
+			channelId = newChannelId
+			logger.Info("channel.created", zap.Int64("new_channel_id", channelId))
+		}
+
 	} else {
 		channelId = params.ChannelId.Value
 	}
@@ -193,53 +210,58 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 		return nil, &apiError{err: err}
 	}
 
-	logger.Debug("uploading chunk",
-		zap.String("fileName", params.FileName),
-		zap.String("partName", params.PartName),
-		zap.String("bot", channelUser),
-		zap.Int("botNo", index),
-		zap.Int("chunkNo", params.PartNo),
-		zap.Int64("partSize", params.ContentLength),
-	)
-
-	fileStream, fileSize, salt, err := a.prepareEncryption(&params, req.Content.Data, params.ContentLength, logger)
-	if err != nil {
-		return nil, &apiError{err: err}
-	}
+	logger.Debug("upload.started", zap.String("bot", channelUser), zap.Int("bot_no", index), zap.Int64("size", params.ContentLength))
 
 	uploadPool := pool.NewPool(client, int64(a.cnf.TG.PoolSize), a.newMiddlewares(ctx, a.cnf.TG.Uploads.MaxRetries)...)
 	defer func() { uploadPool.Close() }()
 
 	var out api.UploadPart
+	// Compute BLAKE3 block hashes on plaintext BEFORE encryption
+	var blockHasher *hash.BlockHasher
+	var reader io.Reader = req.Content.Data
+
+	if params.Hashing.Value {
+		blockHasher = hash.NewBlockHasher()
+		reader = io.TeeReader(req.Content.Data, blockHasher)
+	}
 
 	err = tgc.RunWithAuth(ctx, client, token, func(ctx context.Context) error {
+
 		client := uploadPool.Default(ctx)
-		message, err := a.uploadToTelegram(ctx, client, channelId, &params, fileStream, fileSize, logger)
+
+		fileStream, fileSize, salt, err := a.prepareEncryption(&params, reader, params.ContentLength, logger)
 		if err != nil {
 			return err
 		}
 
-		logger.Debug("upload: saving to database", zap.String("partName", params.PartName))
+		message, err := a.uploadToTelegram(ctx, client, channelId, &params, fileStream, fileSize, logger)
+
+		doc, ok := msgDocument(message)
+
+		if !ok || (doc.Size == 0 && doc.Size != fileSize) {
+			return ErrUploadFailed
+		}
+
+		var blockHashes []byte
+		if blockHasher != nil {
+			blockHashes = blockHasher.Sum()
+		}
 
 		partUpload := &models.Upload{
-			Name:      params.PartName,
-			UploadId:  params.ID,
-			PartId:    message.ID,
-			ChannelId: channelId,
-			Size:      fileSize,
-			PartNo:    params.PartNo,
-			UserId:    userId,
-			Encrypted: params.Encrypted.Value,
-			Salt:      salt,
+			Name:        params.PartName,
+			UploadId:    params.ID,
+			PartId:      message.ID,
+			ChannelId:   channelId,
+			Size:        fileSize,
+			PartNo:      params.PartNo,
+			UserId:      userId,
+			Encrypted:   params.Encrypted.Value,
+			Salt:        salt,
+			BlockHashes: blockHashes,
 		}
 
 		if err := a.db.Create(partUpload).Error; err != nil {
 			return err
-		}
-
-		doc, ok := msgDocument(message)
-		if !ok || doc.Size != fileSize {
-			return ErrUploadFailed
 		}
 
 		out = api.UploadPart{
@@ -255,14 +277,12 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 	})
 
 	if err != nil {
-		logger.Error("upload failed", zap.String("fileName", params.FileName),
-			zap.String("partName", params.PartName),
-			zap.Int("chunkNo", params.PartNo), zap.Error(err))
+		logger.Error("upload.failed", zap.String("file_name", params.FileName),
+			zap.String("part_name", params.PartName),
+			zap.Int("part_no", params.PartNo), zap.Error(err))
 		return nil, &apiError{err: err}
 	}
-	logger.Debug("upload finished", zap.String("fileName", params.FileName),
-		zap.String("partName", params.PartName),
-		zap.Int("chunkNo", params.PartNo))
+	logger.Debug("upload.complete", zap.Int("message_id", out.PartId), zap.Int64("final_size", out.Size), zap.Bool("encrypted", out.Encrypted))
 	return &out, nil
 }
 
@@ -277,10 +297,14 @@ func msgDocument(m tg.MessageClass) (*tg.Document, bool) {
 	}
 
 	media, ok := msg.Media.(*tg.MessageMediaDocument)
+if !ok || media == nil {
+		return nil, false
+	}
+	doc, ok := media.Document.AsNotEmpty()
 	if !ok {
 		return nil, false
 	}
-	return media.Document.AsNotEmpty()
+	return doc, true
 }
 
 func generateRandomSalt() (string, error) {

@@ -41,6 +41,13 @@ func getKey(f reflect.StructField) string {
 	return toKebabCase(f.Name)
 }
 
+type EventConfig struct {
+	PollInterval     time.Duration `default:"10s" description:"Event polling interval for single-instance mode"`
+	DBWorkers        int           `default:"10" description:"Number of DB worker goroutines for event persistence"`
+	DBBufferSize     int           `default:"1000" description:"Size of DB worker queue buffer"`
+	DeduplicationTTL time.Duration `default:"5s" description:"Event deduplication time-to-live"`
+}
+
 type ServerCmdConfig struct {
 	Server   ServerConfig
 	Log      LoggingConfig
@@ -50,6 +57,7 @@ type ServerCmdConfig struct {
 	CronJobs CronJobConfig
 	Cache    CacheConfig
 	Redis    RedisConfig
+	Events   EventConfig
 }
 
 type CheckCmdConfig struct {
@@ -86,9 +94,39 @@ type RedisConfig struct {
 	ConnMaxLifetime time.Duration `default:"1h" description:"Redis connection maximum lifetime"`
 }
 
+// HTTPLoggingConfig holds HTTP request logging configuration
+type HTTPLoggingConfig struct {
+	Enabled            bool     `default:"true" description:"Enable HTTP request logging"`
+	LogQueries         bool     `default:"false" description:"Log full query strings (use with caution)"`
+	SanitizeQueries    bool     `default:"true" description:"Remove sensitive params from query preview"`
+	MaxQueryLength     int      `default:"100" description:"Maximum length of query preview"`
+	LogUserAgent       bool     `default:"true" description:"Log user agent (truncated)"`
+	LogRequestBodySize bool     `default:"true" description:"Log request Content-Length"`
+	LogResponseSize    bool     `default:"true" description:"Log response bytes written"`
+	SkipPaths          []string `default:"/health,/metrics" description:"Paths to skip from logging"`
+}
+
+// DBLoggingConfig holds database query logging configuration
+type DBLoggingConfig struct {
+	Level                string        `default:"error" description:"Database logging level (silent, error, warn, info, debug)"`
+	SlowThreshold        time.Duration `default:"1s" description:"Log queries slower than this threshold"`
+	IgnoreRecordNotFound bool          `default:"true" description:"Don't log 'record not found' errors"`
+	LogSQL               bool          `default:"true" description:"LogSQL"`
+}
+
+// TGLoggingConfig holds Telegram client logging configuration
+type TGLoggingConfig struct {
+	Enabled bool   `default:"false" description:"Enable Telegram client internal logging"`
+	Level   string `default:"warn" description:"Telegram client logging level (debug, info, warn, error)"`
+}
+
 type LoggingConfig struct {
-	Level string `default:"info" description:"Logging level (debug, info, warn, error)"`
-	File  string `default:"" description:"Log file path, if empty logs to stdout"`
+	Level      string `default:"info" description:"Global logging level (debug, info, warn, error)"`
+	TimeFormat string `default:"2006-01-02 15:04:05" description:"Log time format"`
+	File       string `default:"" description:"Log file path, if empty logs to stdout only"`
+	HTTP       HTTPLoggingConfig
+	DB         DBLoggingConfig
+	TG         TGLoggingConfig
 }
 
 type JWTConfig struct {
@@ -106,7 +144,6 @@ type DBPool struct {
 type DBConfig struct {
 	DataSource  string `validate:"required" default:"" description:"Database connection string"`
 	PrepareStmt bool   `default:"true" description:"Use prepared statements"`
-	LogLevel    string `default:"error" description:"Database logging level"`
 	Pool        DBPool
 }
 
@@ -139,7 +176,7 @@ type TGConfig struct {
 	Proxy             string        `default:"" description:"HTTP/SOCKS5 proxy URL"`
 	ReconnectTimeout  time.Duration `default:"5m" description:"Client reconnection timeout"`
 	PoolSize          int           `default:"8" description:"Session pool size"`
-	EnableLogging     bool          `default:"false" description:"Enable Telegram client logging"`
+	EnableLogging     bool          `default:"false" description:"Enable Telegram client logging (deprecated: use logging.tg.enabled instead)"`
 	AppId             int           `default:"2496" description:"Telegram app ID"`
 	AppHash           string        `default:"8da85b0d5bfe62527e5b244c209159c3" description:"Telegram app hash"`
 	DeviceModel       string        `default:"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/116.0" description:"Device model"`
@@ -153,6 +190,20 @@ type TGConfig struct {
 	ChannelLimit      int64         `default:"500000" description:"Channel message limit before auto channel creation"`
 	Uploads           TGUpload
 	Stream            TGStream
+	// Session storage configuration for Telegram sessions
+	Session SessionStorageConfig
+}
+
+type BoltSessionConfig struct {
+	Path       string        `default:"" description:"Path to BoltDB session file (empty for auto-detect)"`
+	Timeout    time.Duration `default:"1s" description:"Timeout for opening BoltDB"`
+	NoGrowSync bool          `default:"false" description:"Disable grow sync for performance"`
+}
+
+type SessionStorageConfig struct {
+	Type string            `default:"postgres" description:"Session storage type: postgres, bolt, memory"`
+	Key  string            `default:"session" description:"Key prefix for session storage"`
+	Bolt BoltSessionConfig `koanf:"bolt"`
 }
 
 type ConfigLoader struct {
